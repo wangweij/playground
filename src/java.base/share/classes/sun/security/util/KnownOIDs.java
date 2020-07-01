@@ -144,6 +144,7 @@ public enum KnownOIDs {
     SHA3_512("2.16.840.1.101.3.4.2.10", "SHA3-512"),
     SHAKE128("2.16.840.1.101.3.4.2.11"),
     SHAKE256("2.16.840.1.101.3.4.2.12"),
+    SHAKE256_LEN("2.16.840.1.101.3.4.2.18", "SHAKE256-LEN"),
     HmacSHA3_224("2.16.840.1.101.3.4.2.13", "HmacSHA3-224"),
     HmacSHA3_256("2.16.840.1.101.3.4.2.14", "HmacSHA3-256"),
     HmacSHA3_384("2.16.840.1.101.3.4.2.15", "HmacSHA3-384"),
@@ -173,7 +174,7 @@ public enum KnownOIDs {
     OAEP("1.2.840.113549.1.1.7"),
     MGF1("1.2.840.113549.1.1.8"),
     PSpecified("1.2.840.113549.1.1.9"),
-    RSASSA_PSS("1.2.840.113549.1.1.10", "RSASSA-PSS"),
+    RSASSA_PSS("1.2.840.113549.1.1.10", "RSASSA-PSS", "PSS"),
     SHA256withRSA("1.2.840.113549.1.1.11"),
     SHA384withRSA("1.2.840.113549.1.1.12"),
     SHA512withRSA("1.2.840.113549.1.1.13"),
@@ -442,6 +443,7 @@ public enum KnownOIDs {
         } else if (debug != null) {
             debug.println(o.oid + " => " + o.name());
         }
+        name2enum.put("OID." + o.oid, o);
         // only register the stdName and aliases if o.registerNames()
         // returns true
         if (o.registerNames()) {

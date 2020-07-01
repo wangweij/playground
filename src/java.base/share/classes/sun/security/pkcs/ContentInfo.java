@@ -190,8 +190,8 @@ public class ContentInfo {
         if (content == null)
             return null;
 
-        DerInputStream dis = new DerInputStream(content.toByteArray());
-        return dis.getOctetString();
+        DerValue v = new DerValue(content.toByteArray());
+        return v.getOctetString();
     }
 
     public String toString() {

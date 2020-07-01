@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,10 +27,15 @@ package jdk.security.jarsigner;
 
 import com.sun.jarsigner.ContentSigner;
 import com.sun.jarsigner.ContentSignerParameters;
+import sun.security.pkcs.PKCS7;
+import sun.security.pkcs.PKCS9Attribute;
+import sun.security.pkcs.PKCS9Attributes;
+import sun.security.timestamp.HttpTimestamper;
 import sun.security.tools.PathList;
 import sun.security.tools.jarsigner.TimestampedSigner;
 import sun.security.util.ManifestDigester;
 import sun.security.util.SignatureFileVerifier;
+import sun.security.util.SignatureUtil;
 import sun.security.x509.AlgorithmId;
 
 import java.io.*;
@@ -44,8 +49,10 @@ import java.security.cert.CertPath;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.security.spec.InvalidParameterSpecException;
 import java.util.*;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -231,8 +238,7 @@ public final class JarSigner {
                 throws NoSuchAlgorithmException {
             // Check availability
             Signature.getInstance(Objects.requireNonNull(algorithm));
-            AlgorithmId.checkKeyAndSigAlgMatch(
-                    privateKey.getAlgorithm(), algorithm);
+            SignatureUtil.checkKeyAndSigAlgMatch(privateKey, algorithm);
             this.sigalg = algorithm;
             this.sigProvider = null;
             return this;
@@ -262,8 +268,7 @@ public final class JarSigner {
             Signature.getInstance(
                     Objects.requireNonNull(algorithm),
                     Objects.requireNonNull(provider));
-            AlgorithmId.checkKeyAndSigAlgMatch(
-                    privateKey.getAlgorithm(), algorithm);
+            SignatureUtil.checkKeyAndSigAlgMatch(privateKey, algorithm);
             this.sigalg = algorithm;
             this.sigProvider = provider;
             return this;
@@ -448,7 +453,9 @@ public final class JarSigner {
          *      will throw an {@link IllegalArgumentException}.
          */
         public static String getDefaultSignatureAlgorithm(PrivateKey key) {
-            return AlgorithmId.getDefaultSigAlgForKey(Objects.requireNonNull(key));
+            // Attention: sync the spec with SignatureUtil::ecStrength and
+            // SignatureUtil::ifcFfcStrength.
+            return SignatureUtil.getDefaultSigAlgForKey(Objects.requireNonNull(key));
         }
 
         /**
@@ -498,7 +505,10 @@ public final class JarSigner {
     private final String tSADigestAlg;
     private final boolean signManifest; // "sign" the whole manifest
     private final boolean externalSF; // leave the .SF out of the PKCS7 block
+
+    @Deprecated(since="15", forRemoval=true)
     private final String altSignerPath;
+    @Deprecated(since="15", forRemoval=true)
     private final String altSigner;
 
     private JarSigner(JarSigner.Builder builder) {
@@ -568,7 +578,8 @@ public final class JarSigner {
             throw new JarSignerException("Error applying timestamp", e);
         } catch (IOException ioe) {
             throw new JarSignerException("I/O error", ioe);
-        } catch (NoSuchAlgorithmException | InvalidKeyException e) {
+        } catch (NoSuchAlgorithmException | InvalidKeyException
+                | InvalidParameterSpecException e) {
             throw new JarSignerException("Error in signer materials", e);
         } catch (SignatureException se) {
             throw new JarSignerException("Error creating signature", se);
@@ -654,7 +665,7 @@ public final class JarSigner {
 
     private void sign0(ZipFile zipFile, OutputStream os)
             throws IOException, CertificateException, NoSuchAlgorithmException,
-            SignatureException, InvalidKeyException {
+            SignatureException, InvalidKeyException, InvalidParameterSpecException {
         MessageDigest[] digests;
         try {
             digests = new MessageDigest[digestalg.length];
@@ -827,34 +838,62 @@ public final class JarSigner {
 
         byte[] block;
 
-        Signature signer;
-        if (sigProvider == null ) {
-            signer = Signature.getInstance(sigalg);
-        } else {
-            signer = Signature.getInstance(sigalg, sigProvider);
-        }
-        signer.initSign(privateKey);
-
         baos.reset();
         sf.write(baos);
         byte[] content = baos.toByteArray();
 
-        signer.update(content);
-        byte[] signature = signer.sign();
+        // Make this true after we remove the ContentSigner thing.
+        boolean alwaysUseNewMethod = false;
 
-        @SuppressWarnings("removal")
-        ContentSigner signingMechanism = null;
-        if (altSigner != null) {
-            signingMechanism = loadSigningMechanism(altSigner,
-                    altSignerPath);
+        // For newer sigalg without "with", always use the new PKCS7
+        // generateToken method. Otherwise, use deprecated ContentSigner.
+        if (alwaysUseNewMethod ||
+                !sigalg.toUpperCase(Locale.ENGLISH).contains("WITH")) {
+            if (altSigner != null) {
+                throw new IllegalArgumentException(
+                        "Customized ContentSigner is not supported for " + sigalg);
+            }
+            Function<byte[], PKCS9Attributes> timestamper = null;
+            if (tsaUrl != null) {
+                timestamper = s -> {
+                    try {
+                        // Timestamp the signature
+                        HttpTimestamper tsa = new HttpTimestamper(tsaUrl);
+                        byte[] tsToken = PKCS7.generateTimestampToken(
+                                tsa, tSAPolicyID, tSADigestAlg, s);
+
+                        return new PKCS9Attributes(new PKCS9Attribute[]{
+                                new PKCS9Attribute(
+                                        PKCS9Attribute.SIGNATURE_TIMESTAMP_TOKEN_OID,
+                                        tsToken)});
+                    } catch (IOException | CertificateException e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+            }
+            // We now create authAttrs in block data, so "direct == false".
+            block = PKCS7.generateNewSignedData(sigalg, sigProvider, privateKey, certChain,
+                    content, externalSF, false, timestamper);
+        } else {
+            Signature signer = SignatureUtil.fromKey(sigalg, privateKey, sigProvider);
+            signer.update(content);
+            byte[] signature = signer.sign();
+
+            @SuppressWarnings("removal")
+            ContentSignerParameters params =
+                    new JarSignerParameters(null, tsaUrl, tSAPolicyID,
+                            tSADigestAlg, signature,
+                            signer.getAlgorithm(), certChain, content, zipFile);
+            @SuppressWarnings("removal")
+            ContentSigner signingMechanism = (altSigner != null)
+                    ? loadSigningMechanism(altSigner, altSignerPath)
+                    : new TimestampedSigner();
+            block = signingMechanism.generateSignedData(
+                    params,
+                    externalSF,
+                    params.getTimestampingAuthority() != null
+                            || params.getTimestampingAuthorityCertificate() != null);
         }
-
-        @SuppressWarnings("removal")
-        ContentSignerParameters params =
-                new JarSignerParameters(null, tsaUrl, tSAPolicyID,
-                        tSADigestAlg, signature,
-                        signer.getAlgorithm(), certChain, content, zipFile);
-        block = sf.generateBlock(params, externalSF, signingMechanism);
 
         String sfFilename = sf.getMetaName();
         String bkFilename = sf.getBlockName(privateKey);
@@ -1176,30 +1215,13 @@ public final class JarSigner {
 
         // get .DSA (or .DSA, .EC) file name
         public String getBlockName(PrivateKey privateKey) {
-            String keyAlgorithm = privateKey.getAlgorithm();
-            return getBaseSignatureFilesName(baseName) + keyAlgorithm;
-        }
-
-        // Generates the PKCS#7 content of block file
-        @SuppressWarnings("removal")
-        public byte[] generateBlock(ContentSignerParameters params,
-                                    boolean externalSF,
-                                    ContentSigner signingMechanism)
-                throws NoSuchAlgorithmException,
-                       IOException, CertificateException {
-
-            if (signingMechanism == null) {
-                signingMechanism = new TimestampedSigner();
-            }
-            return signingMechanism.generateSignedData(
-                    params,
-                    externalSF,
-                    params.getTimestampingAuthority() != null
-                        || params.getTimestampingAuthorityCertificate() != null);
+            String type = SignatureFileVerifier.getBlockExtension(privateKey);
+            return getBaseSignatureFilesName(baseName) + type;
         }
     }
 
     @SuppressWarnings("removal")
+    @Deprecated(since="15", forRemoval=true)
     class JarSignerParameters implements ContentSignerParameters {
 
         private String[] args;
